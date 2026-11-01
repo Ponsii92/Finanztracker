@@ -1,0 +1,109 @@
+<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Finanz-Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f4f6f9;color:#222}
+header{background:#1f3a5f;color:#fff;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
+main{max-width:1100px;margin:auto;padding:20px}
+.card{background:#fff;border-radius:10px;padding:16px 20px;margin-bottom:20px;box-shadow:0 1px 4px #0001}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:right}
+th:first-child,td:first-child{text-align:left}
+td[contenteditable=true]{background:#fffbea;outline:none}
+.pos{color:#1a7f37;font-weight:600}.neg{color:#c62828;font-weight:600}
+button{background:#1f3a5f;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;margin-right:4px}
+.tabs button{background:#ccd6e3;color:#1f3a5f}.tabs button.on{background:#1f3a5f;color:#fff}
+.del{background:none;color:#c62828;padding:0 4px}
+#login{max-width:320px;margin:80px auto}#login input{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
+canvas{max-height:300px;margin-top:12px}.hint{color:#666;font-size:13px}
+</style></head><body>
+<div id="login" class="card" hidden><h2>Finanz-Tracker</h2>
+<input id="email" type="email" placeholder="E-Mail"><input id="pw" type="password" placeholder="Passwort">
+<button onclick="login()">Anmelden</button><p id="err" class="neg"></p></div>
+<div id="app" hidden>
+<header><b>Finanz-Tracker</b><span><button onclick="exportXlsx()">Excel-Export</button><button onclick="sb.auth.signOut().then(()=>location.reload())">Abmelden</button></span></header>
+<main><div class="tabs" id="tabs"></div><br>
+<div class="card"><h3>Kennzahlen</h3><div id="t_kpi"></div><p class="hint">Vermögenswachstum / Netto = Vermögenszuwachs ÷ (Netto aktiv + passiv) im selben Jahr. Enthält Kursgewinne und -verluste, ist also keine reine Sparquote.</p></div>
+<div class="card"><h3>Aktives Einkommen</h3><div id="t_akt"></div><canvas id="c_akt"></canvas></div>
+<div class="card"><h3>Passives Einkommen</h3><div id="t_pas"></div><canvas id="c_pas"></canvas></div>
+<div class="card"><h3>Gesamtes Vermögen</h3><div id="ziel"></div><div id="t_ver"></div><canvas id="c_ver"></canvas></div>
+</main></div>
+<script>
+const SUPABASE_URL='https://xctygnmkmpkwlmetyete.supabase.co', SUPABASE_KEY='sb_publishable_PMX7R2uZ8iEcHZGJ3w6E3A_-W3ERGSc';
+const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+const fmt=v=>v==null||v===''||isNaN(v)?'–':Math.round(v).toLocaleString('de-CH');
+const pctVal=(a,b)=>(a==null||!b)?null:(a/b-1)*100;
+const pctHtml=p=>p==null?'–':`<span class="${p>=0?'pos':'neg'}">${p.toFixed(1)} %</span>`;
+const sum=(r,ks)=>ks.reduce((s,k)=>s+(+r[k]||0),0);
+const charts={};let personen=[],pid=null,D={},ziele=[];
+const CFG={
+ akt:{table:'aktives_einkommen',cols:[['jahr','Jahr','t'],['alter_txt','Alter','t'],['arbeitgeber','Arbeitgeber','t'],['brutto','Brutto / Jahr'],['netto','Netto / Jahr']],
+  total:r=>+r.netto||0,totalLabel:null,chart:['brutto','netto'],type:'line'},
+ pas:{table:'passives_einkommen',cols:[['jahr','Jahr','t'],['wohnungsmiete','Wohnungsmiete'],['dividenden','Dividenden'],['sw_ag','SW AG (Aktivitäten)']],
+  total:r=>sum(r,['wohnungsmiete','dividenden','sw_ag']),totalLabel:'Netto / Jahr',chart:['wohnungsmiete','dividenden','sw_ag'],type:'bar'},
+ ver:{table:'vermoegen',cols:[['jahr','Jahr','t'],['aktien_etf','Aktien & ETF'],['schweizer_konto','Schweizer Konto'],['saeule_3a','3A Säule'],['wohnung','Wohnung'],['sparkasse','Sparkasse']],
+  total:r=>sum(r,['aktien_etf','schweizer_konto','saeule_3a','wohnung','sparkasse']),totalLabel:'Reinvermögen',chart:['aktien_etf','schweizer_konto','saeule_3a','wohnung','sparkasse'],type:'bar'}
+};
+const show=on=>{document.getElementById('login').hidden=on;app.hidden=!on;};
+async function login(){const {error}=await sb.auth.signInWithPassword({email:email.value,password:pw.value});
+ if(error)err.textContent='Login fehlgeschlagen';else start();}
+async function loadAll(){
+ personen=(await sb.from('personen').select().order('id')).data||[];
+ for(const k in CFG)D[k]=(await sb.from(CFG[k].table).select()).data||[];
+ ziele=(await sb.from('ziele').select()).data||[];}
+async function start(){show(true);await loadAll();pid=pid||personen[0]?.id;draw();}
+function draw(){
+ tabs.innerHTML=personen.map(p=>`<button class="${p.id==pid?'on':''}" onclick="pid=${p.id};draw()">${p.name}</button>`).join('')
+  +`<button class="${pid=='all'?'on':''}" onclick="pid='all';draw()">Gemeinsam</button><button onclick="addPerson()">+ Person</button>`;
+ for(const k in CFG)render(k);renderKpi();renderZiel();}
+// Zeilen der aktuellen Ansicht; "Gemeinsam" summiert alle Personen pro Jahr
+function rows(k){const c=CFG[k];
+ if(pid!=='all')return D[k].filter(r=>r.person_id==pid).sort((a,b)=>a.jahr.localeCompare(b.jahr));
+ const m={};D[k].forEach(r=>{const o=m[r.jahr]??={jahr:r.jahr};
+  c.cols.forEach(([f,,t])=>{if(!t)o[f]=(o[f]||0)+(+r[f]||0);});
+  if(k==='akt')o.arbeitgeber=[...new Set([o.arbeitgeber,r.arbeitgeber].filter(Boolean))].join(' / ');});
+ return Object.values(m).sort((a,b)=>a.jahr.localeCompare(b.jahr));}
+const editable=()=>pid!=='all';
+function render(k){const c=CFG[k],data=rows(k),ed=editable();
+ let h='<table><tr>'+c.cols.map(x=>`<th>${x[1]}</th>`).join('')+(c.totalLabel?`<th>${c.totalLabel}</th>`:'')+'<th>% Anstieg</th>'+(ed?'<th></th>':'')+'</tr>';
+ data.forEach((r,i)=>{const prev=data[i-1];
+  h+='<tr>'+c.cols.map(([f,,t])=>`<td contenteditable="${ed}" onblur="${ed?`save('${k}',${r.id},'${f}',this.innerText,${!t})`:''}">${t?(r[f]??''):fmt(r[f])}</td>`).join('')
+   +(c.totalLabel?`<td><b>${fmt(c.total(r))}</b></td>`:'')+`<td>${prev?pctHtml(pctVal(c.total(r),c.total(prev))):'–'}</td>`
+   +(ed?`<td><button class="del" onclick="del('${k}',${r.id})">✕</button></td>`:'')+'</tr>';});
+ h+='</table>'+(ed?`<br><button onclick="add('${k}')">+ Jahr</button>`:'<p class="hint">Gemeinsame Ansicht: Summe aller Personen, nur lesend.</p>');
+ document.getElementById('t_'+k).innerHTML=h;
+ const ds=c.chart.map(f=>({label:c.cols.find(x=>x[0]==f)[1],data:data.map(r=>r[f]),tension:.3}));
+ if(k==='ver'){const z=curZiel();if(z?.betrag)ds.push({type:'line',label:`Ziel ${fmt(z.betrag)}${z.jahr?' bis '+z.jahr:''}`,data:data.map(()=>z.betrag),borderColor:'#c62828',borderDash:[6,4],pointRadius:0,fill:false});}
+ charts[k]?.destroy();
+ charts[k]=new Chart(document.getElementById('c_'+k),{type:c.type,data:{labels:data.map(r=>r.jahr),datasets:ds},
+  options:{scales:{x:{stacked:c.type=='bar'},y:{stacked:c.type=='bar'}}}});}
+// Kennzahlen inkl. Sparquote
+function kpiRows(){const a=rows('akt'),p=rows('pas'),v=rows('ver');
+ return v.map((r,i)=>{const net=(+a.find(x=>x.jahr==r.jahr)?.netto||0)+CFG.pas.total(p.find(x=>x.jahr==r.jahr)||{});
+  const zu=i?CFG.ver.total(r)-CFG.ver.total(v[i-1]):null;
+  return {jahr:r.jahr,netto:net,vermoegen:CFG.ver.total(r),zuwachs:zu,quote:zu!=null&&net?zu/net*100:null};});}
+function renderKpi(){const z=curZiel();
+ t_kpi.innerHTML='<table><tr><th>Jahr</th><th>Netto gesamt</th><th>Reinvermögen</th><th>Zuwachs</th><th>Vermögenswachstum / Netto</th>'+(z?.betrag?'<th>Zum Ziel fehlen</th>':'')+'</tr>'
+ +kpiRows().map(r=>`<tr><td>${r.jahr}</td><td>${fmt(r.netto)}</td><td>${fmt(r.vermoegen)}</td><td>${r.zuwachs==null?'–':`<span class="${r.zuwachs>=0?'pos':'neg'}">${fmt(r.zuwachs)}</span>`}</td><td>${r.quote==null?'–':pctHtml(r.quote)}</td>${z?.betrag?`<td>${fmt(Math.max(0,z.betrag-r.vermoegen))}</td>`:''}</tr>`).join('')+'</table>';}
+// Vermögensziel pro Ansicht (Person oder Gemeinsam)
+const curZiel=()=>ziele.find(z=>z.ansicht==String(pid));
+function renderZiel(){const z=curZiel();
+ ziel.innerHTML=`<p class="hint">Ziel: <b>${z?.betrag?fmt(z.betrag)+(z.jahr?' bis '+z.jahr:''):'keins gesetzt'}</b> <button onclick="setZiel()">Ziel setzen</button></p>`;}
+async function setZiel(){const b=prompt('Zielbetrag (CHF)',curZiel()?.betrag||'');if(b===null)return;const j=prompt('Bis Jahr',curZiel()?.jahr||'');
+ const {error}=await sb.from('ziele').upsert({ansicht:String(pid),betrag:b?Number(b.replace(/[^\d.-]/g,'')):null,jahr:j||null});if(error)alert(error.message);await start();}
+async function addPerson(){const n=prompt('Name');if(n){await sb.from('personen').insert({name:n});await start();}}
+async function save(k,id,f,v,num){v=v.trim();const val=num?(v===''||v==='–'?null:Number(v.replace(/[^\d.-]/g,''))):v;
+ const {error}=await sb.from(CFG[k].table).update({[f]:val}).eq('id',id);if(error)alert(error.message);await start();}
+async function add(k){const j=prompt('Jahr');if(j){const {error}=await sb.from(CFG[k].table).insert({person_id:pid,jahr:j});if(error)alert(error.message);await start();}}
+async function del(k,id){if(confirm('Zeile löschen?')){await sb.from(CFG[k].table).delete().eq('id',id);await start();}}
+// Excel-Export der aktuellen Ansicht
+function exportXlsx(){const wb=XLSX.utils.book_new(),names={akt:'Aktives Einkommen',pas:'Passives Einkommen',ver:'Vermögen'};
+ for(const k in CFG){const c=CFG[k];
+  const out=rows(k).map(r=>{const o={};c.cols.forEach(([f,l])=>o[l]=r[f]??'');if(c.totalLabel)o[c.totalLabel]=c.total(r);return o;});
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(out),names[k]);}
+ XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(kpiRows().map(r=>({Jahr:r.jahr,'Netto gesamt':r.netto,'Reinvermögen':r.vermoegen,Zuwachs:r.zuwachs,'Vermögenswachstum / Netto %':r.quote==null?'':+r.quote.toFixed(1)}))),'Kennzahlen');
+ const n=pid==='all'?'Gemeinsam':personen.find(p=>p.id==pid)?.name;XLSX.writeFile(wb,`Finanzen_${n}.xlsx`);}
+sb.auth.getSession().then(({data})=>data.session?start():show(false));
+</script></body></html>
